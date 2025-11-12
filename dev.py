@@ -3,13 +3,17 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 from torch.nn import functional as F  # pyright: ignore[reportMissingImports]
 
 #hyperparams
-batch_size = 32
-block_size = 8
+batch_size = 64
+block_size = 256
 max_iters = 5000
-eval_interval = 300
+eval_interval = 500
 eval_iters = 200
-learning_rate = 1e-3
-n_embd = 32
+learning_rate = 3e-4
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(device)
 
@@ -48,16 +52,17 @@ def get_batch(split):
 
 @torch.no_grad()
 def estimate_loss():
+    #should make more explicit but for this its fine
     out = {}
-    model.eval()
+    model.eval()  # pyright: ignore[reportUndefinedVariable]
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y  = get_batch(split)
-            logits, loss  = model(X, Y)
+            logits, loss  = model(X, Y)  # pyright: ignore[reportUndefinedVariable]
             losses[k] = loss.item()
         out[split] = losses.mean()
-    model.train()
+    model.train()  # pyright: ignore[reportUndefinedVariable]
     return out
 
 class Head(nn.Module):
@@ -69,6 +74,8 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         B,T,C = x.shape
@@ -78,6 +85,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2,-1) * C**-0.5 # (B, T, C) @ (B, C, T) --> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
         # weighted aggregation of the values
         v = self.value(x) # (B, T, C)
         out = wei @ v # (B, T, T) @ (B, T, C) --> (B, T, C)
@@ -92,10 +100,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
 
 class FeedForward(nn.Module):
@@ -109,6 +118,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embd, 4* n_embd),
             nn.ReLU(),
             nn.Linear(4* n_embd, n_embd), #proj layer
+            nn.Dropout(dropout)
         )
     def forward(self, x):
         return self.net(x)
@@ -139,12 +149,8 @@ class BigramLanguageModel(nn.Module):
         #each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            nn.LayerNorm(n_embd),
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
