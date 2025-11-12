@@ -49,6 +49,7 @@ class CasualSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) #reassemble all head outputs side by side
         #output projection
         y = self.c_proj(y)
+        return y
 
 
 class MLP(nn.Module):
@@ -58,6 +59,13 @@ class MLP(nn.Module):
         self.c_fc   = nn.Linear(config.n_embd, 4*config.n_embd)
         self.gelu   = nn.GELU(approximate='tanh') #relu but not exactly flat tail  
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
+    
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
 
 class Block(nn.Module):
     
@@ -90,7 +98,7 @@ class GPT(nn.Module):
 
     def forward(self, idx):
         B, T = idx.size()
-        assert T <= self.config.block_size(f'Cannot forward sequence length of {T}, block size is {self.config.block_size}')
+        assert T <= self.config.block_size, f'Cannot forward sequence length of {T}, block size is {self.config.block_size}'
         #forward token and pos embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) #pos embeddings of shape (T, n_embd)
@@ -159,4 +167,40 @@ max_length = 30
 
 model = GPT.from_pretrained('gpt2')
 model.eval() #not training
-model.to("cuda") 
+model.to('cuda') 
+
+#prefix tokens as example in the dev notebook
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to('cuda')
+
+#generation (slightly inefficent)
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+while x.size(1) < max_length:
+    #forward model to get logits
+    with torch.no_grad():
+        logits = model(x)
+        #take the logits at the last position
+        logits = logits[:, -1, :]
+        #get probabilities
+        probs = F.softmax(logits, dim=-1)
+        #do top-k sampling of 50 (example did the hugging face default)
+        #topk_probs becomes (5, 50), topk_indicies is (5, 50), 
+        topk_probs, topk_indicies = torch.topk(probs, 50, dim=-1)
+        #select a token
+        ix = torch.multinomial(topk_probs, 1)
+        #gather the corresponding indicies
+        xcol = torch.gather(topk_indicies, -1, ix)
+        #append the token to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+#print generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
