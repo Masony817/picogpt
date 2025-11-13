@@ -1,11 +1,9 @@
 from dataclasses import dataclass
 import math
 import torch
+import tiktoken
 import torch.nn as nn
 from torch.nn import functional as F
-
-
-
 
 @dataclass
 class GPTConfig:
@@ -15,8 +13,10 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768 # embedding dim
 
+    learning_rate = 3e-4
 
-class CasualSelfAttention(nn.Module):
+
+class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -25,6 +25,7 @@ class CasualSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         #out projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.PICOGPT_SCALE_INIT = 1
         #regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -59,6 +60,7 @@ class MLP(nn.Module):
         self.c_fc   = nn.Linear(config.n_embd, 4*config.n_embd)
         self.gelu   = nn.GELU(approximate='tanh') #relu but not exactly flat tail  
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
+        self.c_proj.PICOGPT_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -72,7 +74,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -95,8 +97,25 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        #weight tying scheme
+        self.transformer.wte.weight = self.lm_head.weight #copies the data pointer which is the same
+        
+        # init params
+        self.apply(self._init_weights)
 
-    def forward(self, idx):
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'PICOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f'Cannot forward sequence length of {T}, block size is {self.config.block_size}'
         #forward token and pos embeddings
@@ -110,7 +129,10 @@ class GPT(nn.Module):
         #forward the final layer norm and classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -161,21 +183,78 @@ class GPT(nn.Module):
 
         return model
 
-#-------------inference------------
+class DataLoader:
+    #overly simple dataloader
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        #at init load tokens from disk into mem
+        with open('../pico-shakespere/input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens) #left on cpu 
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        self.current_pos = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_pos: self.current_pos+B*T+1]
+        x = buf[:-1].view(B, T) #inputs
+        y = buf[1:].view(B, T) #targets
+        #advance tensor pos
+        self.current_pos += B * T
+        #reset if loading the next batch would be out of dataset bounds
+        if self.current_pos + (B * T + 1) > len(self.tokens):
+            self.current_pos = 0
+        return x, y
+
+#----------------------------------------------------------------------------
+#device detection -- should be cuda for my case
+device = "cpu" #good default
+if torch.cuda.is_available():
+    device = "cuda" #work on my workstation
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps" # work on my macbook
+print(f"using device:", device)
+
+torch.manual_seed(1337) #reproducibility
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoader(B=4, T=32)
+#get logits
+# --- model = GPT.from_pretrained('gpt2') --- load og gpt2 weights but not necessary right now
+model = GPT(GPTConfig())
+model.to(device)
+
+#optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=GPTConfig.learning_rate)
+step_count = 50
+for i in range(step_count):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+print(f'final loss from {step_count} steps is {loss.item()} ')
+
+import sys; sys.exit(0) # -- debug --
+
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained('gpt2')
-model.eval() #not training
-model.to('cuda') 
-
 #prefix tokens as example in the dev notebook
-import tiktoken
 enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to('cuda')
+x = tokens.to(device)
 
 #generation (slightly inefficent)
 torch.manual_seed(42)
@@ -184,7 +263,7 @@ torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
     #forward model to get logits
     with torch.no_grad():
-        logits = model(x)
+        logits, _ = model(x)
         #take the logits at the last position
         logits = logits[:, -1, :]
         #get probabilities
