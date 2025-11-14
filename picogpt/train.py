@@ -42,11 +42,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, nh, T, hs)
-        #attention
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T]  == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) --> (B, nh, T, hs)
+        
+        #self-attention
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T]  == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) --> (B, nh, T, hs)
+        
+        #flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) #reassemble all head outputs side by side
         #output projection
         y = self.c_proj(y)
@@ -225,7 +230,7 @@ torch.manual_seed(1337) #reproducibility
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoader(B=8, T=1024)  #dont have the gpu for b=16 and t=1024
+train_loader = DataLoader(B=16, T=1024) 
 torch.set_float32_matmul_precision("high") #TensorFloat32 avaliable on my 5060ti blackwell
 #get logits
 # --- model = GPT.from_pretrained('gpt2') --- load og gpt2 weights but not necessary right now
@@ -256,40 +261,40 @@ for i in range(step_count):
 
 import sys; sys.exit(0) # -- debug --
 
-num_return_sequences = 5
-max_length = 30
+# num_return_sequences = 5
+# max_length = 30
 
-#prefix tokens as example in the dev notebook
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
+# #prefix tokens as example in the dev notebook
+# enc = tiktoken.get_encoding('gpt2')
+# tokens = enc.encode("Hello, I'm a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+# x = tokens.to(device)
 
-#generation (slightly inefficent)
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+# #generation (slightly inefficent)
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
 
-while x.size(1) < max_length:
-    #forward model to get logits
-    with torch.no_grad():
-        logits, _ = model(x)
-        #take the logits at the last position
-        logits = logits[:, -1, :]
-        #get probabilities
-        probs = F.softmax(logits, dim=-1)
-        #do top-k sampling of 50 (example did the hugging face default)
-        #topk_probs becomes (5, 50), topk_indicies is (5, 50), 
-        topk_probs, topk_indicies = torch.topk(probs, 50, dim=-1)
-        #select a token
-        ix = torch.multinomial(topk_probs, 1)
-        #gather the corresponding indicies
-        xcol = torch.gather(topk_indicies, -1, ix)
-        #append the token to the sequence
-        x = torch.cat((x, xcol), dim=1)
+# while x.size(1) < max_length:
+#     #forward model to get logits
+#     with torch.no_grad():
+#         logits, _ = model(x)
+#         #take the logits at the last position
+#         logits = logits[:, -1, :]
+#         #get probabilities
+#         probs = F.softmax(logits, dim=-1)
+#         #do top-k sampling of 50 (example did the hugging face default)
+#         #topk_probs becomes (5, 50), topk_indicies is (5, 50), 
+#         topk_probs, topk_indicies = torch.topk(probs, 50, dim=-1)
+#         #select a token
+#         ix = torch.multinomial(topk_probs, 1)
+#         #gather the corresponding indicies
+#         xcol = torch.gather(topk_indicies, -1, ix)
+#         #append the token to the sequence
+#         x = torch.cat((x, xcol), dim=1)
 
-#print generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# #print generated text
+# for i in range(num_return_sequences):
+#     tokens = x[i, :max_length].tolist()
+#     decoded = enc.decode(tokens)
+#     print(">", decoded)
