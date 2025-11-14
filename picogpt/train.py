@@ -212,6 +212,7 @@ class DataLoader:
         return x, y
 
 #----------------------------------------------------------------------------
+import time
 #device detection -- should be cuda for my case
 device = "cpu" #good default
 if torch.cuda.is_available():
@@ -224,25 +225,34 @@ torch.manual_seed(1337) #reproducibility
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoader(B=4, T=32)
+train_loader = DataLoader(B=8, T=1024)  #dont have the gpu for b=16 and t=1024
+torch.set_float32_matmul_precision("high") #TensorFloat32 avaliable on my 5060ti blackwell
 #get logits
 # --- model = GPT.from_pretrained('gpt2') --- load og gpt2 weights but not necessary right now
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model)
 
 #optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=GPTConfig.learning_rate)
 step_count = 50
+torch.cuda.empty_cache() #fix cache issues
 for i in range(step_count):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16): #mixed precision bf16 and tf32 
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000 #time difference in mill
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
-print(f'final loss from {step_count} steps is {loss.item()} ')
+#print(f'final loss from {step_count} steps is {loss.item()} ')
 
 import sys; sys.exit(0) # -- debug --
 
