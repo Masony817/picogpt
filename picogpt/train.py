@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+import inspect
 import math
 import torch
 import tiktoken
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers import WarmUp
 
 @dataclass
 class GPTConfig:
@@ -11,9 +13,9 @@ class GPTConfig:
     vocab_size: int = 50257 #number of tokens 50,000 bpe merges, 256 byte tokens, 1 <|endoftext|>
     n_layer: int = 12 # number of layers
     n_head: int = 12
-    n_embd: int = 768 # embedding dim
+    n_embd: int = 768 # embedding dim 
 
-    learning_rate = 3e-4
+    learning_rate = 6e-4 #gpt-3-small max_lr
 
 
 class CausalSelfAttention(nn.Module):
@@ -139,6 +141,28 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        #start with all canidate params that require grad
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        #create optim groups. 2d params will get weight decay
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2] # decay matmul participants and embeddings
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2] #dont decay layernorms and biases
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed paramater tensors: {len(decay_params)}, with {num_decay_params}, parameters")
+        print(f"num non-decayed paramater tensors: {len(nodecay_params)}, with {num_nodecay_params}, parameters")
+        #create adamw and use kernel fusion if available (some pytorch versions dont have it and isnt default)
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused adamw: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused) #gpt-3 paper optimizations
+        return optimizer
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface for testing"""
@@ -232,17 +256,37 @@ if torch.cuda.is_available():
 
 train_loader = DataLoader(B=16, T=1024) 
 torch.set_float32_matmul_precision("high") #TensorFloat32 avaliable on my 5060ti blackwell
+
 #get logits
 # --- model = GPT.from_pretrained('gpt2') --- load og gpt2 weights but not necessary right now
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) #overriding the vocab size with a easier number for ops
 model.to(device)
 model = torch.compile(model)
 
+max_lr = 6e-4 #gpt-3-small max lr
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(it):
+    #linear warmup
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+
+    if it > max_steps:
+        return min_lr
+    #in between the warmup and steps end, use cosine decaying down to the min lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 #optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=GPTConfig.learning_rate)
-step_count = 50
-torch.cuda.empty_cache() #fix cache issues
-for i in range(step_count):
+# (old) optimizer = torch.optim.AdamW(model.parameters(), lr=GPTConfig.learning_rate, betas=(0.9, 0.95), eps=1e-8) #gpt-3 paper optimizations
+optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate=6e-4, device=device)
+
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -250,12 +294,17 @@ for i in range(step_count):
     with torch.autocast(device_type=device, dtype=torch.bfloat16): #mixed precision bf16 and tf32 
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #cliping global norm as seen in gpt-3 (kinda hacky)
+    #determine and set appropriate learning rate for this iter
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000 #time difference in mill
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 #print(f'final loss from {step_count} steps is {loss.item()} ')
 
