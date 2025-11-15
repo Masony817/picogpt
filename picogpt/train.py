@@ -254,6 +254,15 @@ torch.manual_seed(1337) #reproducibility
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+#gradient accumulation setup
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens to match gpt-3 paper
+B = 16   #micro batch size
+T = 1024 #sequence length
+assert total_batch_size % (B * T) == 0, "make sure that the total batch size is dividisble by B*T"
+grad_accum_steps = total_batch_size // (B*T) #is 32 with the above hyperparams
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
 train_loader = DataLoader(B=16, T=1024) 
 torch.set_float32_matmul_precision("high") #TensorFloat32 avaliable on my 5060ti blackwell
 
@@ -283,17 +292,21 @@ def get_lr(it):
 
 
 #optimize
-# (old) optimizer = torch.optim.AdamW(model.parameters(), lr=GPTConfig.learning_rate, betas=(0.9, 0.95), eps=1e-8) #gpt-3 paper optimizations
 optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate=6e-4, device=device)
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16): #mixed precision bf16 and tf32 
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    #gradient accumulation
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): #mixed precision bf16 and tf32 
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps #scaling down by the accum steps to recover the normalizer
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #cliping global norm as seen in gpt-3 (kinda hacky)
     #determine and set appropriate learning rate for this iter
     lr = get_lr(step)
@@ -303,8 +316,8 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000 #time difference in mill
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
+    print(f"step {step} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 #print(f'final loss from {step_count} steps is {loss.item()} ')
 
