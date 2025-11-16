@@ -312,6 +312,7 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoader(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoader(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision("high") #TensorFloat32 avaliable on my 5060ti blackwell
 
@@ -347,6 +348,37 @@ optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate=6e-
 
 for step in range(max_steps):
     t0 = time.time()
+
+    #validation loss split
+    if step % 250 == 0: #every 250 steps validate
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16): #mixed precision bf16 and tf32 
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    if step % 5000 == 0 or step == max_steps - 1:
+        if master_process:
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'step': step,
+                'config': model.config
+            }
+            torch.save(checkpoint, f"checkpoint_step_{step}.pt")
+
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     #gradient accumulation
@@ -379,42 +411,3 @@ for step in range(max_steps):
 if ddp: #cleanup
     destroy_process_group()
 
-#import sys; sys.exit(0) # -- debug --
-
-# num_return_sequences = 5
-# max_length = 30
-
-# #prefix tokens as example in the dev notebook
-# enc = tiktoken.get_encoding('gpt2')
-# tokens = enc.encode("Hello, I'm a language model,")
-# tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-# x = tokens.to(device)
-
-# #generation (slightly inefficent)
-# torch.manual_seed(42)
-# torch.cuda.manual_seed(42)
-
-# while x.size(1) < max_length:
-#     #forward model to get logits
-#     with torch.no_grad():
-#         logits, _ = model(x)
-#         #take the logits at the last position
-#         logits = logits[:, -1, :]
-#         #get probabilities
-#         probs = F.softmax(logits, dim=-1)
-#         #do top-k sampling of 50 (example did the hugging face default)
-#         #topk_probs becomes (5, 50), topk_indicies is (5, 50), 
-#         topk_probs, topk_indicies = torch.topk(probs, 50, dim=-1)
-#         #select a token
-#         ix = torch.multinomial(topk_probs, 1)
-#         #gather the corresponding indicies
-#         xcol = torch.gather(topk_indicies, -1, ix)
-#         #append the token to the sequence
-#         x = torch.cat((x, xcol), dim=1)
-
-# #print generated text
-# for i in range(num_return_sequences):
-#     tokens = x[i, :max_length].tolist()
-#     decoded = enc.decode(tokens)
-#     print(">", decoded)
