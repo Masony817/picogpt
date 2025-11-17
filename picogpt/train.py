@@ -11,6 +11,39 @@ import time
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+import wandb
+import argparse
+
+parser = argparse.ArgumentParser(description='PicoGPT Training')
+
+# Run configurations
+parser.add_argument('--baseline', action='store_true', help='Run baseline configuration (current code)')
+parser.add_argument('--run-1', action='store_true', help='Run configuration 1 (same as baseline)')
+parser.add_argument('--run-2', action='store_true', help='Run configuration 2 (Muon + RoPE + Data fixes)')
+
+# Individual feature flags
+parser.add_argument('--use-muon', action='store_true', help='Use Muon optimizer instead of AdamW')
+parser.add_argument('--use-rope', action='store_true', help='Use RoPE instead of learned positional embeddings')
+parser.add_argument('--data-fixes', action='store_true', help='Enable data shuffling and periodicity fixes')
+
+args = parser.parse_args()
+
+# Initialize defaults
+if not (args.baseline or args.run_1 or args.run_2 or args.use_muon or args.use_rope or args.data_fixes):
+    # if no args, default to baseline
+    args.use_muon = False
+    args.use_rope = False
+    args.data_fixes = False
+# if individual flags are set without run configs they remain as parsed
+# run configurations (these override individual flags)
+if args.run_1 or args.baseline:
+    args.use_muon = False
+    args.use_rope = False
+    args.data_fixes = False
+elif args.run_2:
+    args.use_muon = True
+    args.use_rope = True
+    args.data_fixes = True
 
 
 @dataclass
@@ -20,8 +53,54 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12
     n_embd: int = 768 # embedding dim 
-
+    use_rope: bool = False #use rotary pos embedding instead of learned
     learning_rate = 6e-4 #gpt-3-small max_lr
+
+class RoPEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE) from Su et al. (2021) https://arxiv.org/pdf/2104.09864 """
+
+    def __init__(self, dim, max_seq_len=2048, base=10000): #2048 for inference flexibility
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        #pre compute freq
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        self._seq_len_cached = None
+        self._cos_cached = None
+        self._sin_cached = None
+    
+    def _update_cos_sin_cache(self, seq_len, device, dtype):
+        #if seq length changes update the cos/sin vaules
+        if seq_len != self._seq_len_cached:
+            self._seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=device, dtype=dtype)
+            freqs = torch.outer(t, self.inv_freq.to(dtype))
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self._cos_cached = emb.cos()[None, None, :, :]
+            self._sin_cached = emb.sin()[None, None, :, :]
+        return self._cos_cached, self._sin_cached
+
+    def rotate_half(self, x):
+        #rotate half the hidden dims of the input
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    
+    def apply(self, q, k):
+        seq_len = q.shape[2]
+        cos, sin = self._update_cos_sin_cache(seq_len, q.device, q.dtype)
+
+        q_embed = (q * cos) + (self.rotate_half(q) * sin)
+        k_embed = (k * cos) + (self.rotate_half(k) * sin)
+
+        return q_embed, k_embed
+    
+    def forward(self, q, k):
+        return self.apply(q, k)
+
 
 
 class CausalSelfAttention(nn.Module):
@@ -37,6 +116,12 @@ class CausalSelfAttention(nn.Module):
         #regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.use_rope = config.use_rope
+
+        if self.use_rope:
+            head_dim = config.n_embd // config.n_head
+            self.rope = RoPEmbedding(head_dim, max_seq_len=config.block_size)
+
         #more of a mask but following openai naming 
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .view(1,1, config.block_size, config.block_size))
@@ -51,11 +136,15 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, nh, T, hs)
         
-        #self-attention
+        #regular self-attention
         # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         # att = att.masked_fill(self.bias[:,:,:T,:T]  == 0, float('-inf'))
         # att = F.softmax(att, dim=-1)
         # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) --> (B, nh, T, hs)
+
+        #apply RoPE if enabled
+        if self.use_rope:
+            q, k = self.rope(q, k)
         
         #flash attention
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -102,12 +191,17 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd), #token embedding
-            wpe = nn.Embedding(config.block_size, config.n_embd), #pos embedding
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
-        ))
+        transformer_dict = {
+            'wte': nn.Embedding(config.vocab_size, config.n_embd), #token embedding
+            'h': nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            'ln_f': nn.LayerNorm(config.n_embd),
+        }
+    
+        # add learned positional embeddings if not using RoPE
+        if not config.use_rope:
+            transformer_dict['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+    
+        self.transformer = nn.ModuleDict(transformer_dict)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         #weight tying scheme
@@ -131,11 +225,18 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f'Cannot forward sequence length of {T}, block size is {self.config.block_size}'
-        #forward token and pos embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
-        pos_emb = self.transformer.wpe(pos) #pos embeddings of shape (T, n_embd)
+        
         tok_emb = self.transformer.wte(idx) #token embeddings of shape (B. T, n_embd)
-        x = tok_emb + pos_emb
+        
+        #add pos info (either learned or RoPE handles it in attention)
+        if self.config.use_rope:
+            x = tok_emb #rope is applied in attention layers
+        else:
+        #forward token and use pos embeddings
+            pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+            pos_emb = self.transformer.wpe(pos) #pos embeddings of shape (T, n_embd)
+            x = tok_emb + pos_emb
+
         #forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
