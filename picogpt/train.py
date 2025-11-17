@@ -248,27 +248,82 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay, learning_rate, device, use_muon=False):
         #start with all canidate params that require grad
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        #create optim groups. 2d params will get weight decay
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2] # decay matmul participants and embeddings
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2] #dont decay layernorms and biases
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed paramater tensors: {len(decay_params)}, with {num_decay_params:}, parameters")
-        print(f"num non-decayed paramater tensors: {len(nodecay_params)}, with {num_nodecay_params:}, parameters")
-        #create adamw and use kernel fusion if available (some pytorch versions dont have it and isnt default)
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and 'cuda' in device
-        print(f"using fused adamw: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused) #gpt-3 paper optimizations
-        return optimizer
+
+        if use_muon:
+            #separate params: Muon for 2d weights, AdamW for everythign else
+            muon_params = []
+            adamw_params = []
+
+            for name, param in param_dict.items():
+                #muon: 2d weight matricies (not embeddings or final layer)
+                if (param.ndim == 2 and
+                    'wte' not in name and
+                    'wpe' not in name and
+                    'lm_head' not in name):
+                    muon_params.append(param)
+                else:
+                    adamw_params.append(param)
+                
+            num_muon_params = sum(p.numel() for p in muon_params)
+            num_adamw_params = sum(p.numel() for p in adamw_params)
+            print(f"Muon optimizer: {len(muon_params)} tensors with {num_muon_params:,} parameters")
+            print(f"AdamW optimizer: {len(adamw_params)} tensors with {num_adamw_params:,} parameters")
+        
+            muon_optimizer = torch.optim.Muon(
+                muon_params,
+                lr=0.02,  # ~30x higher than adamw
+                momentum=0.95,  # high
+                nesterov=True,  # nesterov momentum
+                backend='newtonschulz5' # 5 newton-schulz iters
+            )
+
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and 'cuda' in device
+            print(f"using fused adamw: {use_fused}")
+            adamw_optimizer = torch.optim.AdamW(
+                adamw_params,
+                lr=learning_rate, #passed-in lr (6e-4)
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                weight_decay=0.1,
+                fused=use_fused
+            )
+
+            return {'muon': muon_optimizer, 'adamw': adamw_optimizer}
+
+        else:
+            #Pure Adamw: seperate by dimensionality for weight decay
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2] # decay matmul participants and embeddings
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2] #dont decay layernorms and biases
+            
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0}
+            ]
+            
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed paramater tensors: {len(decay_params)}, with {num_decay_params:}, parameters")
+            print(f"num non-decayed paramater tensors: {len(nodecay_params)}, with {num_nodecay_params:}, parameters")
+
+            #create adamw and use kernel fusion if available (some pytorch versions dont have it and isnt default)
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and 'cuda' in device
+            print(f"using fused adamw: {use_fused}")
+            
+            optimizer = torch.optim.AdamW(
+                optim_groups, 
+                lr=learning_rate, 
+                betas=(0.9, 0.95), 
+                eps=1e-8, 
+                fused=use_fused
+            ) #gpt-3 paper optimizations
+
+            return optimizer
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -430,7 +485,7 @@ max_lr = 6e-4 #gpt-3-small max lr
 min_lr = max_lr * 0.1
 warmup_steps = 715 #match gpt-3 warmup schedule
 max_steps = 19073 #match token shards
-def get_lr(it):
+def get_adamw_lr(it):
     #linear warmup
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -445,7 +500,31 @@ def get_lr(it):
 
 
 #optimize
-optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate=6e-4, device=device)
+if args.use_muon:
+    optimizers = raw_model.configure_optimizers(
+        weight_decay = 0.1,
+        learning_rate=6e-4 #used in adamW component
+        device=device
+        use_muon=True
+    )
+    muon_optimizer = optimizers['muon']
+    adamw_optimizer = optimizers['adamw']
+
+    if master_process:
+        print("\n=== Using Muon + AdamW Hybrid ===")
+        print("Muon: constant LR = 0.02")
+        print("AdamW: scheduled LR starting at 6e-4")
+        print("=" * 35 + "\n")
+else:
+    optimizer = raw_model.configure_optimizers(
+        weight_decay = 0.1,
+        learning_rate=6e-4, 
+        device=device,
+        use_muon=False
+    )
+
+    if master_process:
+        print("\n=== Using Pure AdamW ===")
 
 for step in range(max_steps):
     t0 = time.time()
@@ -471,17 +550,32 @@ for step in range(max_steps):
 
     if step % 5000 == 0 or step == max_steps - 1:
         if master_process:
-            checkpoint = {
-                'model': raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'step': step,
-                'config': model.config
-            }
+            if args.use_muon:
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'muon_optimizer': muon_optimizer.state_dict(),
+                    'adamw_optimizer': adamw_optimizer.state_dict(),
+                    'step': step,
+                    'config': raw_model.config
+                }
+            else:
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'step': step,
+                    'config': raw_model.config
+                }
             torch.save(checkpoint, f"checkpoint_step_{step}.pt")
-
     model.train()
-    optimizer.zero_grad()
+
+    if args.use_muon:
+        muon_optimizer.zero_grad()
+        adamw_optimizer.zero_grad()
+    else:
+        optimizer.zero_grad()
+
     loss_accum = 0.0
+
     #gradient accumulation
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
@@ -493,14 +587,30 @@ for step in range(max_steps):
         if ddp: #sync the last step
             model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)
         loss.backward()
+
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) #average the loss accum in distrbuted processing
+    
+    #gradient clipping
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #cliping global norm as seen in gpt-3 (kinda hacky)
+    
     #determine and set appropriate learning rate for this iter
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
+    if args.use_muon:
+        #muon uses a constant LR
+        #only need to update adamw lr
+        adamw_lr = get_adamw_lr(step)
+        for param_group in adamw_optimizer.param_groups:
+            param_group['lr'] = adamw_lr
+    
+        muon_optimizer.step()
+        adamw_optimizer.step()
+        lr = adamw_lr #logging
+    else:
+        lr = get_adamw_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+    
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000 #time difference in mill
