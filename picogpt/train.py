@@ -88,8 +88,8 @@ class RoPEmbedding(nn.Module):
         #rotate half the hidden dims of the input
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
-    
-    def apply(self, q, k):
+
+    def forward(self, q, k):
         seq_len = q.shape[2]
         cos, sin = self._update_cos_sin_cache(seq_len, q.device, q.dtype)
 
@@ -97,10 +97,6 @@ class RoPEmbedding(nn.Module):
         k_embed = (k * cos) + (self.rotate_half(k) * sin)
 
         return q_embed, k_embed
-    
-    def forward(self, q, k):
-        return self.apply(q, k)
-
 
 
 class CausalSelfAttention(nn.Module):
@@ -232,7 +228,7 @@ class GPT(nn.Module):
         if self.config.use_rope:
             x = tok_emb #rope is applied in attention layers
         else:
-        #forward token and use pos embeddings
+            #forward token and use pos embeddings
             pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
             pos_emb = self.transformer.wpe(pos) #pos embeddings of shape (T, n_embd)
             x = tok_emb + pos_emb
@@ -254,7 +250,7 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
         if use_muon:
-            #separate params: Muon for 2d weights, AdamW for everythign else
+            #separate params: Muon for 2d weights, AdamW for everything else
             muon_params = []
             adamw_params = []
 
@@ -278,7 +274,7 @@ class GPT(nn.Module):
                 lr=0.02,  # ~30x higher than adamw
                 momentum=0.95,  # high
                 nesterov=True,  # nesterov momentum
-                backend='newtonschulz5' # 5 newton-schulz iters
+                ns_steps=5 
             )
 
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
@@ -289,7 +285,7 @@ class GPT(nn.Module):
                 lr=learning_rate, #passed-in lr (6e-4)
                 betas=(0.9, 0.95),
                 eps=1e-8,
-                weight_decay=0.1,
+                weight_decay=weight_decay,
                 fused=use_fused
             )
 
@@ -307,8 +303,8 @@ class GPT(nn.Module):
             
             num_decay_params = sum(p.numel() for p in decay_params)
             num_nodecay_params = sum(p.numel() for p in nodecay_params)
-            print(f"num decayed paramater tensors: {len(decay_params)}, with {num_decay_params:}, parameters")
-            print(f"num non-decayed paramater tensors: {len(nodecay_params)}, with {num_nodecay_params:}, parameters")
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,}, parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:}, parameters")
 
             #create adamw and use kernel fusion if available (some pytorch versions dont have it and isnt default)
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
@@ -381,11 +377,13 @@ def load_tokens(filename):
 
 class DataLoader:
     #overly simple dataloader with distributed loading if needed
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, seed=42, shuffle=False):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.seed=seed
+        self.shuffle=shuffle
         assert split in {'train', 'val'}
 
         #get shard filenames
@@ -399,9 +397,24 @@ class DataLoader:
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
         
+        if self.shuffle:
+            self.rng = np.random.RandomState(seed)
+            self.shard_indices = list(range(len(self.shards)))
+            self.rng.shuffle(self.shard_indices)
+        else:
+            self.shard_indices = list(range(len(self.shards)))
+
         #state, init at shard 0
         self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.tokens = load_tokens(self.shards[self.shard_indices[self.current_shard]])
+        self.current_pos = self.B * self.T * self.process_rank
+
+    
+    def reset(self):
+        self.current_shard = 0
+        if self.shuffle:
+            self.rng.shuffle(self.shard_indices)
+        self.tokens = load_tokens(self.shards[self.shard_indices[self.current_shard]])
         self.current_pos = self.B * self.T * self.process_rank
 
     
@@ -415,9 +428,28 @@ class DataLoader:
         #reset if loading the next batch would be out of dataset bounds
         if self.current_pos + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
+            #reshuffle at epoch completion
+            if self.shuffle and self.current_shard == 0:
+                self.rng.shuffle(self.shard_indices)
+            self.tokens = load_tokens(self.shards[self.shard_indices[self.current_shard]])
             self.current_pos = self.B * self.T * self.process_rank
         return x, y
+
+def log_model_stats(model, step):
+    """Log model parameter statistics"""
+    if master_process and step % 1000 == 0:  # Every 1000 steps
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        # Get parameter norms
+        param_norm = sum(p.norm().item() ** 2 for p in model.parameters()) ** 0.5
+        
+        wandb.log({
+            "model/total_params": total_params,
+            "model/trainable_params": trainable_params,
+            "model/param_norm": param_norm,
+            "step": step
+        })
 
 #----------------------------------------------------------------------------
 """
@@ -467,14 +499,14 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoader(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoader(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+train_loader = DataLoader(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", shuffle=args.data_fixes)
+val_loader = DataLoader(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", shuffle=False) #dont shuffle on validation
 
 torch.set_float32_matmul_precision("high") #TensorFloat32 avaliable on my 5060ti blackwell
 
 #create model
 # --- model = GPT.from_pretrained('gpt2') --- load og gpt2 weights but not necessary right now
-model = GPT(GPTConfig(vocab_size=50304)) #overriding the vocab size with a easier number for ops
+model = GPT(GPTConfig(vocab_size=50304, use_rope=args.use_rope)) #overriding the vocab size with a easier number for ops
 model.to(device)
 model = torch.compile(model)
 if ddp:
@@ -497,6 +529,69 @@ def get_adamw_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
+
+if master_process:
+    # Determine run name based on configuration
+    if args.baseline or args.run_1:
+        run_name = "baseline"
+    elif args.run_2:
+        run_name = "run-2-full"
+    else:
+        # Custom configuration
+        features = []
+        if args.use_muon: features.append("muon")
+        if args.use_rope: features.append("rope")
+        if args.data_fixes: features.append("datafixes")
+        run_name = "-".join(features) if features else "baseline"
+    
+    wandb.init(
+        entity="yarbrough-labs",
+        project="PicoGPT",
+        name=run_name,
+        config={
+            # Model hyperparameters
+            "model_type": "gpt",
+            "n_layer": raw_model.config.n_layer,
+            "n_head": raw_model.config.n_head,
+            "n_embd": raw_model.config.n_embd,
+            "vocab_size": raw_model.config.vocab_size,
+            "block_size": raw_model.config.block_size,
+            
+            # Training hyperparameters
+            "batch_size": B,
+            "sequence_length": T,
+            "total_batch_size": total_batch_size,
+            "grad_accum_steps": grad_accum_steps,
+            "max_lr": max_lr,
+            "min_lr": min_lr,
+            "warmup_steps": warmup_steps,
+            "max_steps": max_steps,
+            "weight_decay": 0.1,
+            
+            # Optimization config
+            "use_muon": args.use_muon,
+            "use_rope": args.use_rope,
+            "data_fixes": args.data_fixes,
+            "optimizer": "muon+adamw" if args.use_muon else "adamw",
+            
+            # Muon specific (if used)
+            "muon_lr": 0.02 if args.use_muon else None,
+            "muon_momentum": 0.95 if args.use_muon else None,
+            
+            # System
+            "device": device,
+            "ddp": ddp,
+            "ddp_world_size": ddp_world_size if ddp else 1,
+            "precision": "bfloat16",
+        }
+    )
+    
+    # Optionally watch model (can be heavy, comment out if too much)
+    # wandb.watch(raw_model, log="all", log_freq=1000)
+    
+    print(f"\n✓ Weights & Biases initialized: {run_name}")
+    print(f"  Project: PicoGPT")
+    print(f"  Run URL: {wandb.run.get_url()}\n")
 
 
 #optimize
@@ -526,6 +621,7 @@ else:
     if master_process:
         print("\n=== Using Pure AdamW ===")
 
+#training loop
 for step in range(max_steps):
     t0 = time.time()
 
@@ -547,6 +643,10 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            wandb.log({
+                "val/loss": val_loss_accum.item(),
+                "step": step
+            })
 
     if step % 5000 == 0 or step == max_steps - 1:
         if master_process:
@@ -566,6 +666,9 @@ for step in range(max_steps):
                     'config': raw_model.config
                 }
             torch.save(checkpoint, f"checkpoint_step_{step}.pt")
+            wandb.save(f"checkpoint_step_{step}.pt")
+            wandb.log({"checkpoint/step": step})
+
     model.train()
 
     if args.use_muon:
@@ -618,7 +721,30 @@ for step in range(max_steps):
     tokens_per_sec = (tokens_processed) / (dt / 1000) #seconds
     if master_process:
         print(f"step {step} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        
+        # Log to wandb
+        wandb.log({
+            "train/loss": loss_accum.item(),
+            "train/learning_rate": lr,
+            "train/grad_norm": norm,
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/step_time_ms": dt,
+            "step": step
+        })
 
+        # Log model stats periodically
+        log_model_stats(raw_model, step)
+        
+        # Log Muon LR separately if using Muon
+        if args.use_muon:
+            wandb.log({
+                "train/muon_lr": 0.02,
+                "train/adamw_lr": lr,
+                "step": step
+            })
 if ddp: #cleanup
     destroy_process_group()
 
+if master_process:
+    wandb.finish()
+    print("\n✓ Training complete! Weights & Biases run finished.")
