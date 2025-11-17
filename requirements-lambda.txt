@@ -1,0 +1,21 @@
+# requirements-lambda.txt
+# Additional Python dependencies for Lambda Labs 8×H100 cluster
+# Lambda Stack 24.04 pre-includes: PyTorch 2.7, CUDA 12.8, NCCL 2.26, Triton 3.3
+# Only install project-specific packages not covered by Lambda Stack
+
+# Dataset handling (same versions as local dev)
+tiktoken>=0.7.0
+datasets>=2.19.0
+pyarrow>=14.0.2
+tqdm>=4.66.1
+
+# Experiment tracking
+wandb>=0.17.0
+
+# HuggingFace transformers (Lambda Stack may not include this)
+transformers>=4.44.0
+
+# Note: torch, numpy, and CUDA toolkit are already provided by Lambda Stack
+# To verify installed versions on Lambda instance, run:
+#   python3 -c "import torch; print(torch.__version__)"
+#   dpkg -l | grep nvidia-cuda-toolkit
