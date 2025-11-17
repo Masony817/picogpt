@@ -503,8 +503,8 @@ def get_adamw_lr(it):
 if args.use_muon:
     optimizers = raw_model.configure_optimizers(
         weight_decay = 0.1,
-        learning_rate=6e-4 #used in adamW component
-        device=device
+        learning_rate=6e-4, #used in adamW component
+        device=device,
         use_muon=True
     )
     muon_optimizer = optimizers['muon']
