@@ -5,7 +5,6 @@ import tiktoken
 from datasets import load_dataset 
 from tqdm import tqdm 
 
-# ------------------------------------------
 # config for the FineWeb dataset download and processing
 LOCAL_DIRECTORY = "edu_fineweb10B"
 DATASET_NAME = "sample-10BT"

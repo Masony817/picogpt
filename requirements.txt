@@ -9,6 +9,7 @@ torch>=2.5.0
 # Core ML dependencies
 numpy>=1.24.4
 tiktoken>=0.7.0
+pandas>=2.0.0
 
 # Dataset handling
 datasets>=2.19.0
@@ -20,3 +21,6 @@ wandb>=0.17.0
 
 # HuggingFace transformers (for GPT-2 pretrained model loading)
 transformers>=4.44.0
+
+# Evaluation
+lm-eval>=0.4.0
