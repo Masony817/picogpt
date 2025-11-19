@@ -73,7 +73,7 @@ def calculate_perplexity(model, tokenizer, dataset, max_length=1024, limit=100):
 
     with torch.no_grad():
         for i, item in enumerate(subset):
-            text = item.get('text', '') or item.get('content', '')
+            text = item.get('text', '') or item.get('content', '') or item.get('code', '')
             if not text or len(text.strip()) < 10:
                 continue
             
@@ -89,9 +89,12 @@ def calculate_perplexity(model, tokenizer, dataset, max_length=1024, limit=100):
             outputs = model(input_ids, labels=target_ids)
             
             # recover total NLL for this sequence (mean_loss * seq_len)
+            # the loss is calculated on seq_len - 1 tokens (next token prediction)
             seq_len = input_ids.size(1)
-            total_nll += outputs.loss.item() * seq_len
-            total_tokens += seq_len
+            pred_len = seq_len - 1
+            if pred_len > 0:
+                total_nll += outputs.loss.item() * pred_len
+                total_tokens += pred_len
             
     if total_tokens == 0:
         return float('inf')
@@ -107,6 +110,52 @@ def measure_repetition(text, n=3):
     if not ngrams:
         return 1.0
     return len(set(ngrams)) / len(ngrams)
+
+
+def verify_environment(models_config, eval_datasets):
+    print("\n" + "="*60)
+    print("pre-flight check")
+    print("="*60)
+    
+    # check datasets
+    print("checking datasets...")
+    if not eval_datasets:
+        print(" no datasets loaded!")
+    
+    for name, ds in eval_datasets.items():
+        try:
+            if hasattr(ds, 'take'):
+                next(iter(ds.take(1)))
+            elif hasattr(ds, 'select'):
+                _ = ds.select(range(1))[0]
+            else:
+                _ = ds[0]
+            print(f" -> dataset '{name}' accessible")
+        except Exception as e:
+            raise RuntimeError(f"dataset '{name}' check failed: {e}")
+
+    # load/check models
+    print("\nchecking models...")
+    for name, model_id in models_config.items():
+        print(f" -> verifying {name}...")
+        try:
+            model, tokenizer = load_model(model_id)
+            
+            # quick forward pass to verify
+            inp = tokenizer("test", return_tensors='pt').to(model.device)
+            with torch.no_grad():
+                model(inp.input_ids)
+                
+            del model
+            del tokenizer
+            gc.collect()
+            torch.cuda.empty_cache()
+            print(f" -> model '{name}' loadable and runnable")
+        except Exception as e:
+            raise RuntimeError(f"model '{name}' check failed: {e}")
+
+    print("\npre-flight checks passed.")
+    print("="*60 + "\n")
 
 
 #eval loop
@@ -130,6 +179,14 @@ try:
 except Exception as e:
     print(f"error loading datasets: {e}")
     eval_datasets = {}
+
+# Verify environment before starting
+try:
+    verify_environment(models_config, eval_datasets)
+except Exception as e:
+    print(f"\npre-flight check failed: {e}")
+    print("aborting evaluation!")
+    exit(1)
 
 for name, model_id in models_config.items():
     print(f"\n" + "-"*40)
@@ -221,7 +278,7 @@ for name, model_id in models_config.items():
         torch.cuda.empty_cache()
         
     except Exception as e:
-        print(f"CRITICAL ERROR processing {name}: {e}")
+        print(f"! error processing {name}: {e}")
         continue
 
 #reporting
@@ -262,4 +319,4 @@ with open('eval_results.json', 'w') as f:
     json.dump(all_results, f, indent=2, default=convert)
 
 print(f"\nresults saved to eval_results.json")
-print(f"WandB run: {wandb.run.get_url()}")
+print(f"WandB run: {wandb.run.url}")

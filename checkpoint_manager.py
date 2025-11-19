@@ -6,7 +6,7 @@ import re
 from typing import Optional, Tuple, Union, List
 from dataclasses import asdict
 
-from transformers import PreTrainedModel, PretrainedConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import PreTrainedModel, PretrainedConfig, AutoTokenizer, AutoModelForCausalLM, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 #local model definitions
@@ -46,7 +46,7 @@ class PicoGPTHFConfig(PretrainedConfig):
             use_rope=config.use_rope,
         )
 
-class PicoGPTHF(PreTrainedModel):
+class PicoGPTHF(PreTrainedModel, GenerationMixin):
 
     config_class = PicoGPTHFConfig
 
@@ -80,9 +80,22 @@ class PicoGPTHF(PreTrainedModel):
         # PicoGPT doesn't natively use the attention_mask and it assumes causal masking only,
         # but we accept it to conform to HF API.
         
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         # forward pass in the underlying model
         # GPT.forward returns (logits, loss)
-        logits, loss = self.model(input_ids, targets=labels)
+
+        # ignore the internal loss because we need to do HF-style shifting here
+        logits, _ = self.model(input_ids)
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
             return (logits, loss) if loss is not None else (logits,)
@@ -102,7 +115,7 @@ class PicoGPTHF(PreTrainedModel):
 
 def get_wandb_checkpoint(run_name_query: str, project="PicoGPT", entity="yarbrough-labs", download_root='checkpoints') -> str:
 
-    api = wandb.api()
+    api = wandb.Api()
 
     runs = api.runs(f"{entity}/{project}")
     matched_runs = [r for r in runs if run_name_query in r.name or run_name_query == r.name]
@@ -125,7 +138,7 @@ def get_wandb_checkpoint(run_name_query: str, project="PicoGPT", entity="yarbrou
         raise FileNotFoundError(f"no checkpoints found for run {target_run.name}")
     
     def get_step(filename):
-        match = re.search(r"checkpoint_step_(/d+)\.pt", filename)
+        match = re.search(r"checkpoint_step_(\d+)\.pt", filename)
         return int(match.group(1) if match else -1)
     
     latest_ckpt = max(checkpoint_files, key=lambda x: get_step(x.name))
@@ -184,7 +197,13 @@ def load_model(model_identifier: str, device: str = 'cuda' if torch.cuda.is_avai
             raise ValueError(f"Couldn't find model/run '{model_identifier} locally or on WanB")
     
     print(f"Loading weights from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # for legacy checkpoints where GPTConfig was defined in __main__
+    import sys
+    if not hasattr(sys.modules['__main__'], 'GPTConfig'):
+        sys.modules['__main__'].GPTConfig = GPTConfig
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract config and state dict
     if 'config' in checkpoint:
