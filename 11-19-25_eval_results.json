@@ -1,0 +1,71 @@
+{
+  "benchmarks": {
+    "gpt2-base": {
+      "hellaswag": 0.2891854212308305,
+      "piqa": 0.6289445048966268,
+      "winogrande": 0.516179952644041,
+      "arc_easy": 0.43813131313131315,
+      "boolq": 0.4871559633027523
+    },
+    "run1-3.44loss": {
+      "hellaswag": 0.27454690300736906,
+      "piqa": 0.6044613710554951,
+      "winogrande": 0.5090765588003157,
+      "arc_easy": 0.4802188552188552,
+      "boolq": 0.6018348623853211
+    },
+    "run2-3.74loss": {
+      "hellaswag": 0.27066321449910374,
+      "piqa": 0.5946681175190425,
+      "winogrande": 0.5201262825572218,
+      "arc_easy": 0.4574915824915825,
+      "boolq": 0.5746177370030581
+    }
+  },
+  "perplexity": {
+    "gpt2-base": {
+      "wikitext": 49.20992876161468,
+      "code": 19.791097565549265,
+      "books": 165.16081164409553
+    },
+    "run1-3.44loss": {
+      "wikitext": 77.49081245977959,
+      "code": 36.32912068714729,
+      "books": 316.4270428771972
+    },
+    "run2-3.74loss": {
+      "wikitext": 114.01058683309162,
+      "code": 78.63920303723546,
+      "books": 377.2607623153509
+    }
+  },
+  "generations": {
+    "The capital of France is": {
+      "gpt2-base": "The capital of France is the birthplace of modern medievalism, a genre that has been at the forefront of contemporary cultural thought for more than two centuries. Medieval Europe is divided into the two major spheres: its medieval culture and its modern culture. The first of these, the country of modernity, is the center of French culture. France's main heritage is its early medieval culture, the French Revolution. This historic and cultural period is often cited as the pre-Christian period of the French Revolution. This is often misunderstood as a"
+    },
+    "Photosynthesis is the process by which": {
+      "gpt2-base": "Photosynthesis is the process by which plants produce carbohydrates and protein by converting the energy stored in their cells into energy. An enzyme called PGC-1 (in plant cells) catalyzes the conversion of carbohydrates to protein by converting their energy to sunlight.\n\nIn plant cells, the PGC-1 enzyme produces photosynthesis in the form of photosynthesis energy, which is generated when the sun strikes the soil and photosynthesizes the food. Plants produce their own food after harvest, but their photosynthesis needs to be replenished"
+    },
+    "The American Civil War began in": {
+      "gpt2-base": "The American Civil War began in earnest in July 1863, and was a major force in the battle against the Confederate army. In a battle that would take a long time to reach its end, the Confederate army was victorious and many of the men in the army were killed in the battle.\n\n\nThe Union Army fought well. The Union Army had the best cavalry and artillery equipment. They were also more experienced and well organized. The Confederate Army was able to take advantage of the weakness of the American South and capture the South directly."
+    },
+    "If you drop a ball from a building, it will": {
+      "gpt2-base": "If you drop a ball from a building, it will hit the ground. When you hit a building with a baseball, you will lose the ball. The next ball hits the ground and hits you. This is called a catch.\n\nThis is called a catch. If you hit a runner with a bat, you will miss a base hit. This is called a catch. The next run you hit with a runner hits your base, and you will miss two bases with one out. This is called a catch. Your base is knocked away.\n"
+    },
+    "To bake a cake, first you need to": {
+      "gpt2-base": "To bake a cake, first you need to clean the pan from the bottom of the oven rack. Then, when you have the cake, bake it a minute or two.\n\nThen you place it on a lightly floured surface and sprinkle with a little bit of the sugar. It should be very soft, but you may need to push it to a thick enough thickness to make it more of a pillow with the sugar.\n\nOnce you have made the cake, it's time to put the frosting on. In my opinion,"
+    },
+    "Once upon a time, there was a": {
+      "gpt2-base": "Once upon a time, there was a sense of mystery and curiosity and excitement. It was a moment, I think, that became more compelling and more important as we went into the game. It was one of those moments where you're like, \"Wow, I think this game has something to do with this.\" You feel like you're witnessing something happen to you.\n\nIs it interesting to you to see that you are a part of a team that's built to defeat a lot of different teams?\n\nWell, you know"
+    },
+    "The detective walked into the room and saw": {
+      "gpt2-base": "The detective walked into the room and saw that the woman was trying to get out of the way, and the girl was trying to get in the way. She was walking off, and then she realized the girl was getting into a car and she ended up getting into the car.\n\nI said, \"Are you going to call the police if you're in a vehicle with that number?\"\n\nThe girl said, \"No, I'm not going to call the police.\"\n\nThe cop said, \"You can use the"
+    },
+    "In Python, you can define a function using": {
+      "gpt2-base": "In Python, you can define a function using the Python module name. For example, here is a typical function that defines the type function for a list of integers (the list is defined as a tuple):\n\n>>> from collections import lists >>> f = lists.extend([1, 2, 3]) >>> f.sort(1)\n\nYou can also use the Python module name. For example, here is a typical function with a list of integers (a tuple that has the same type as the list):\n\n>>> f"
+    }
+  },
+  "diversity": {
+    "gpt2-base": 0.9545631470335254
+  }
+}
